@@ -1,0 +1,167 @@
+name: distributed-search-engine
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        SERVICE: api
+    container_name: search-api
+    environment:
+      API_PORT: ${API_PORT}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      OPENSEARCH_URL: ${OPENSEARCH_URL}
+    ports:
+      - "${API_PORT}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - search-network
+
+  crawler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        SERVICE: crawler
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      OPENSEARCH_URL: ${OPENSEARCH_URL}
+      CRAWLER_MAX_CONCURRENCY: ${CRAWLER_MAX_CONCURRENCY}
+      CRAWLER_PER_DOMAIN_CONCURRENCY: ${CRAWLER_PER_DOMAIN_CONCURRENCY}
+      CRAWLER_REQUEST_DELAY_SECONDS: ${CRAWLER_REQUEST_DELAY_SECONDS}
+      CRAWLER_REQUEST_TIMEOUT_SECONDS: ${CRAWLER_REQUEST_TIMEOUT_SECONDS}
+      CRAWLER_MAX_RESPONSE_BYTES: ${CRAWLER_MAX_RESPONSE_BYTES}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - search-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: search-frontend
+    environment:
+      VITE_API_URL: ${VITE_API_URL}
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - search-network
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: search-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - search-network
+
+  redis:
+    image: redis:8-alpine
+    container_name: search-redis
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - search-network
+
+  opensearch:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION}
+    container_name: search-opensearch
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --silent --fail http://localhost:9200/_cluster/health || exit 1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+    networks:
+      - search-network
+
+networks:
+  search-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  opensearch-data:
+  frontend-node-modules:

@@ -67,7 +67,7 @@ React Search Interface
 - [x] Create API health endpoint
 - [x] Create crawler worker entry point
 - [x] Initialise React frontend
-- [ ] Add Docker Compose development environment
+- [x] Add Docker Compose development environment
 
 ### Phase 2 — URL frontier
 
