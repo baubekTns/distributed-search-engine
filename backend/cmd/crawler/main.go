@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,7 +14,9 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/baubekTns/distributed-search-engine/backend/internal/config"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/crawler"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/frontier"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/security"
 )
 
 func main() {
@@ -45,38 +50,113 @@ func main() {
 		log.Fatalf("Redis connection failed: %v", err)
 	}
 
+	validator := security.NewDestinationValidator(
+		net.DefaultResolver,
+	)
+
+	transport := crawler.NewSafeTransport(validator)
+
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   cfg.CrawlerRequestTimeout,
+		CheckRedirect: func(
+			request *http.Request,
+			previous []*http.Request,
+		) error {
+			if len(previous) >= cfg.CrawlerMaxRedirects {
+				return crawler.ErrTooManyRedirects
+			}
+
+			_, err := validator.Validate(
+				request.Context(),
+				request.URL,
+			)
+
+			return err
+		},
+	}
+
+	crawlerClient := crawler.NewClient(
+		httpClient,
+		validator,
+		crawler.NewDomainLimiter(cfg.CrawlerRequestDelay),
+		cfg.CrawlerUserAgent,
+		cfg.CrawlerMaxResponseBytes,
+	)
+
 	log.Println("crawler worker started")
 
-	runWorker(ctx, frontierService)
+	runWorker(ctx, frontierService, crawlerClient)
+
+	transport.CloseIdleConnections()
 
 	log.Println("crawler worker stopped")
 }
 
-func runWorker(ctx context.Context, frontierService *frontier.Frontier) {
+func runWorker(
+	ctx context.Context,
+	frontierService *frontier.Frontier,
+	crawlerClient *crawler.Client,
+) {
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			log.Println("crawler shutdown requested")
 			return
-
-		default:
-			targetURL, err := frontierService.Dequeue(ctx, 5*time.Second)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-
-				log.Printf("failed to retrieve crawl job: %v", err)
-				time.Sleep(time.Second)
-				continue
-			}
-
-			if targetURL == "" {
-				continue
-			}
-
-			// Actual HTTP fetching will be implemented in the next phase.
-			log.Printf("received crawl job: %s", targetURL)
 		}
+
+		targetURL, err := frontierService.Dequeue(
+			ctx,
+			5*time.Second,
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+
+			log.Printf("failed to retrieve crawl job: %v", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		if targetURL == "" {
+			continue
+		}
+
+		fetchContext, cancel := context.WithTimeout(
+			ctx,
+			20*time.Second,
+		)
+
+		result, err := crawlerClient.Fetch(
+			fetchContext,
+			targetURL,
+		)
+
+		cancel()
+
+		if err != nil {
+			switch {
+			case errors.Is(err, crawler.ErrRobotsDenied):
+				log.Printf("crawl denied by robots.txt: %s", targetURL)
+
+			case errors.Is(err, security.ErrUnsafeAddress):
+				log.Printf("unsafe destination rejected: %s", targetURL)
+
+			default:
+				log.Printf("failed to crawl %s: %v", targetURL, err)
+			}
+
+			continue
+		}
+
+		log.Printf(
+			"crawled URL=%s status=%d type=%s bytes=%d",
+			result.FinalURL,
+			result.StatusCode,
+			result.ContentType,
+			len(result.Body),
+		)
+
+		// HTML parsing and link extraction come in the next phase.
 	}
 }
