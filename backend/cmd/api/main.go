@@ -1,22 +1,55 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	apiHandlers "github.com/baubekTns/distributed-search-engine/backend/internal/api"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/config"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/frontier"
 )
 
 func main() {
-	port := getEnvironmentVariable("API_PORT", "8080")
+	cfg := config.Load()
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+	})
+
+	frontierService := frontier.New(redisClient)
+	defer func() {
+		if err := frontierService.Close(); err != nil {
+			log.Printf("failed to close Redis client: %v", err)
+		}
+	}()
+
+	startupContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := frontierService.Ping(startupContext); err != nil {
+		log.Fatalf("Redis connection failed: %v", err)
+	}
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
 
 		if err := json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
@@ -26,8 +59,11 @@ func main() {
 		}
 	})
 
+	frontierHandler := apiHandlers.NewFrontierHandler(frontierService)
+	frontierHandler.RegisterRoutes(mux)
+
 	server := &http.Server{
-		Addr:              ":" + port,
+		Addr:              ":" + cfg.APIPort,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -35,20 +71,28 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("search API listening on port %s", port)
+	go func() {
+		log.Printf("search API listening on port %s", cfg.APIPort)
 
-	if err := server.ListenAndServe(); err != nil &&
-		!errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("API server failed: %v", err)
+		if err := server.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("API server failed: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+
+	log.Println("API shutdown requested")
+
+	shutdownContext, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownContext); err != nil {
+		log.Printf("API shutdown failed: %v", err)
 	}
-}
 
-func getEnvironmentVariable(key string, fallback string) string {
-	value := os.Getenv(key)
-
-	if value == "" {
-		return fallback
-	}
-
-	return value
+	log.Println("API stopped")
 }
