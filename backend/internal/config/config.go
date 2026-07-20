@@ -16,6 +16,7 @@ type Config struct {
 	CrawlerRequestDelay     time.Duration
 	CrawlerMaxResponseBytes int64
 	CrawlerMaxRedirects     int
+	CrawlerMaxLinksPerPage  int
 }
 
 func Load() Config {
@@ -42,6 +43,10 @@ func Load() Config {
 		CrawlerMaxRedirects: getEnvInt(
 			"CRAWLER_MAX_REDIRECTS",
 			3,
+		),
+		CrawlerMaxLinksPerPage: getEnvInt(
+			"CRAWLER_MAX_LINKS_PER_PAGE",
+			100,
 		),
 	}
 }

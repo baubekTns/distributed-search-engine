@@ -71,10 +71,10 @@ React Search Interface
 
 ### Phase 2 — URL frontier
 
-- [ ] Add seed URL submission
-- [ ] Create Redis-backed URL queue
-- [ ] Normalise URLs
-- [ ] Prevent duplicate queue entries
+- [x] Add seed URL submission
+- [x] Create Redis-backed URL queue
+- [x] Normalise URLs
+- [x] Prevent duplicate queue entries
 - [ ] Track crawl depth and retry count
 
 ### Phase 3 — Safe crawler
@@ -89,8 +89,8 @@ React Search Interface
 
 ### Phase 4 — Parsing and storage
 
-- [ ] Extract page titles and visible text
-- [ ] Extract and normalise outgoing links
+- [x] Extract page titles and visible text
+- [x] Extract and normalise outgoing links
 - [ ] Generate content hashes
 - [ ] Detect duplicate pages
 - [ ] Store page metadata in PostgreSQL

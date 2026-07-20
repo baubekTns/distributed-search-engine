@@ -53,6 +53,7 @@ services:
       CRAWLER_MAX_RESPONSE_BYTES: ${CRAWLER_MAX_RESPONSE_BYTES}
       CRAWLER_USER_AGENT: ${CRAWLER_USER_AGENT}
       CRAWLER_MAX_REDIRECTS: ${CRAWLER_MAX_REDIRECTS}
+      CRAWLER_MAX_LINKS_PER_PAGE: ${CRAWLER_MAX_LINKS_PER_PAGE}
     depends_on:
       postgres:
         condition: service_healthy
