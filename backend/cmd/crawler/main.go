@@ -34,7 +34,10 @@ func main() {
 		Addr: cfg.RedisAddr,
 	})
 
-	frontierService := frontier.New(redisClient)
+	frontierService := frontier.New(
+		redisClient,
+		cfg.CrawlerMaxPagesPerDomain,
+	)
 	defer func() {
 		if err := frontierService.Close(); err != nil {
 			log.Printf("failed to close Redis client: %v", err)
@@ -96,6 +99,8 @@ func main() {
 		frontierService,
 		crawlerClient,
 		pageParser,
+		cfg.CrawlerMaxDepth,
+		cfg.CrawlerMaxRetries,
 	)
 
 	transport.CloseIdleConnections()
@@ -108,6 +113,8 @@ func runWorker(
 	frontierService *frontier.Frontier,
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
+	maxDepth int,
+	maxRetries int,
 ) {
 	for {
 		if ctx.Err() != nil {
@@ -115,7 +122,7 @@ func runWorker(
 			return
 		}
 
-		targetURL, err := frontierService.Dequeue(
+		job, err := frontierService.Dequeue(
 			ctx,
 			5*time.Second,
 		)
@@ -129,26 +136,30 @@ func runWorker(
 			continue
 		}
 
-		if targetURL == "" {
+		if job.URL == "" {
 			continue
 		}
 
-		processURL(
+		processJob(
 			ctx,
-			targetURL,
+			job,
 			frontierService,
 			crawlerClient,
 			pageParser,
+			maxDepth,
+			maxRetries,
 		)
 	}
 }
 
-func processURL(
+func processJob(
 	ctx context.Context,
-	targetURL string,
+	job frontier.Job,
 	frontierService *frontier.Frontier,
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
+	maxDepth int,
+	maxRetries int,
 ) {
 	fetchContext, cancel := context.WithTimeout(
 		ctx,
@@ -158,60 +169,119 @@ func processURL(
 
 	result, err := crawlerClient.Fetch(
 		fetchContext,
-		targetURL,
+		job.URL,
 	)
 	if err != nil {
-		logFetchError(targetURL, err)
+		logFetchError(job.URL, err)
+
+		if shouldRetry(err) && job.Retry < maxRetries {
+			job.Retry++
+
+			if requeueErr := frontierService.Requeue(
+				ctx,
+				job,
+			); requeueErr != nil {
+				log.Printf(
+					"failed to requeue %s: %v",
+					job.URL,
+					requeueErr,
+				)
+			}
+
+			return
+		}
+
+		if markErr := frontierService.MarkFailed(
+			ctx,
+			job,
+			err.Error(),
+		); markErr != nil {
+			log.Printf(
+				"failed to mark job failed %s: %v",
+				job.URL,
+				markErr,
+			)
+		}
+
 		return
 	}
 
 	log.Printf(
-		"crawled URL=%s status=%d type=%s bytes=%d",
+		"crawled URL=%s depth=%d retry=%d status=%d type=%s bytes=%d",
 		result.FinalURL,
+		job.Depth,
+		job.Retry,
 		result.StatusCode,
 		result.ContentType,
 		len(result.Body),
 	)
 
-	if !parser.SupportsContentType(result.ContentType) {
-		log.Printf(
-			"content type does not require HTML parsing: URL=%s type=%s",
+	if parser.SupportsContentType(result.ContentType) {
+		parsedPage, parseErr := pageParser.Parse(
 			result.FinalURL,
-			result.ContentType,
+			result.Body,
 		)
-		return
+		if parseErr != nil {
+			log.Printf(
+				"failed to parse page %s: %v",
+				result.FinalURL,
+				parseErr,
+			)
+
+			if markErr := frontierService.MarkFailed(
+				ctx,
+				job,
+				parseErr.Error(),
+			); markErr != nil {
+				log.Printf(
+					"failed to mark job failed: %v",
+					markErr,
+				)
+			}
+
+			return
+		}
+
+		log.Printf(
+			"parsed URL=%s title=%q text_bytes=%d links=%d depth=%d",
+			parsedPage.URL,
+			parsedPage.Title,
+			len(parsedPage.Text),
+			len(parsedPage.Links),
+			job.Depth,
+		)
+
+		if job.Depth < maxDepth {
+			enqueueDiscoveredLinks(
+				ctx,
+				job,
+				parsedPage,
+				frontierService,
+			)
+		} else {
+			log.Printf(
+				"maximum crawl depth reached URL=%s depth=%d",
+				job.URL,
+				job.Depth,
+			)
+		}
 	}
 
-	parsedPage, err := pageParser.Parse(
-		result.FinalURL,
-		result.Body,
-	)
-	if err != nil {
+	if err := frontierService.MarkCompleted(
+		ctx,
+		job,
+	); err != nil {
 		log.Printf(
-			"failed to parse page %s: %v",
-			result.FinalURL,
+			"failed to mark job completed %s: %v",
+			job.URL,
 			err,
 		)
-		return
 	}
-
-	log.Printf(
-		"parsed URL=%s title=%q text_bytes=%d links=%d",
-		parsedPage.URL,
-		parsedPage.Title,
-		len(parsedPage.Text),
-		len(parsedPage.Links),
-	)
-
-	enqueueDiscoveredLinks(
-		ctx,
-		parsedPage,
-		frontierService,
-	)
 }
 
 func enqueueDiscoveredLinks(
 	ctx context.Context,
+	parentJob frontier.Job,
 	parsedPage parser.Page,
 	frontierService *frontier.Frontier,
 ) {
@@ -220,10 +290,18 @@ func enqueueDiscoveredLinks(
 	rejectedCount := 0
 
 	for _, discoveredURL := range parsedPage.Links {
-		_, added, err := frontierService.Enqueue(
+		discoveredJob := frontier.Job{
+			URL:       discoveredURL,
+			Depth:     parentJob.Depth + 1,
+			Retry:     0,
+			SourceURL: parentJob.URL,
+		}
+
+		_, added, err := frontierService.EnqueueJob(
 			ctx,
-			discoveredURL,
+			discoveredJob,
 		)
+
 		if err != nil {
 			rejectedCount++
 
@@ -238,15 +316,15 @@ func enqueueDiscoveredLinks(
 
 		if added {
 			enqueuedCount++
-			continue
+		} else {
+			duplicateCount++
 		}
-
-		duplicateCount++
 	}
 
 	log.Printf(
-		"link discovery URL=%s discovered=%d enqueued=%d duplicate=%d rejected=%d",
+		"link discovery URL=%s depth=%d discovered=%d enqueued=%d duplicate=%d rejected=%d",
 		parsedPage.URL,
+		parentJob.Depth,
 		len(parsedPage.Links),
 		enqueuedCount,
 		duplicateCount,
@@ -304,5 +382,30 @@ func logFetchError(targetURL string, err error) {
 			targetURL,
 			err,
 		)
+	}
+}
+
+func shouldRetry(err error) bool {
+	switch {
+	case errors.Is(err, crawler.ErrRobotsDenied):
+		return false
+
+	case errors.Is(err, crawler.ErrUnsupportedType):
+		return false
+
+	case errors.Is(err, crawler.ErrResponseTooLarge):
+		return false
+
+	case errors.Is(err, crawler.ErrTooManyRedirects):
+		return false
+
+	case errors.Is(err, security.ErrUnsafeAddress):
+		return false
+
+	case errors.Is(err, context.Canceled):
+		return false
+
+	default:
+		return true
 	}
 }

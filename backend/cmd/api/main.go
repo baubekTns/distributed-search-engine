@@ -32,7 +32,10 @@ func main() {
 		Addr: cfg.RedisAddr,
 	})
 
-	frontierService := frontier.New(redisClient)
+	frontierService := frontier.New(
+		redisClient,
+		cfg.CrawlerMaxPagesPerDomain,
+	)
 	defer func() {
 		if err := frontierService.Close(); err != nil {
 			log.Printf("failed to close Redis client: %v", err)

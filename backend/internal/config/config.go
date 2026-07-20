@@ -11,12 +11,15 @@ type Config struct {
 	APIPort   string
 	RedisAddr string
 
-	CrawlerUserAgent        string
-	CrawlerRequestTimeout   time.Duration
-	CrawlerRequestDelay     time.Duration
-	CrawlerMaxResponseBytes int64
-	CrawlerMaxRedirects     int
-	CrawlerMaxLinksPerPage  int
+	CrawlerUserAgent         string
+	CrawlerRequestTimeout    time.Duration
+	CrawlerRequestDelay      time.Duration
+	CrawlerMaxResponseBytes  int64
+	CrawlerMaxRedirects      int
+	CrawlerMaxLinksPerPage   int
+	CrawlerMaxDepth          int
+	CrawlerMaxPagesPerDomain int
+	CrawlerMaxRetries        int
 }
 
 func Load() Config {
@@ -47,6 +50,18 @@ func Load() Config {
 		CrawlerMaxLinksPerPage: getEnvInt(
 			"CRAWLER_MAX_LINKS_PER_PAGE",
 			100,
+		),
+		CrawlerMaxDepth: getEnvInt(
+			"CRAWLER_MAX_DEPTH",
+			3,
+		),
+		CrawlerMaxPagesPerDomain: getEnvInt(
+			"CRAWLER_MAX_PAGES_PER_DOMAIN",
+			500,
+		),
+		CrawlerMaxRetries: getEnvInt(
+			"CRAWLER_MAX_RETRIES",
+			2,
 		),
 	}
 }

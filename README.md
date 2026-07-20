@@ -75,7 +75,9 @@ React Search Interface
 - [x] Create Redis-backed URL queue
 - [x] Normalise URLs
 - [x] Prevent duplicate queue entries
-- [ ] Track crawl depth and retry count
+- [x] Track crawl depth and retry count
+- [x] Track queued, processing, completed and failed jobs
+- [x] Limit pages discovered per domain
 
 ### Phase 3 — Safe crawler
 
