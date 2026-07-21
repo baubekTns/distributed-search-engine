@@ -19,9 +19,13 @@ import (
 	"github.com/baubekTns/distributed-search-engine/backend/internal/indexer"
 )
 
-func main() {
-	cfg := config.Load()
+const (
+	startupTimeout  = 15 * time.Second
+	shutdownTimeout = 10 * time.Second
+	requestTimeout  = 10 * time.Second
+)
 
+func main() {
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -29,30 +33,11 @@ func main() {
 	)
 	defer stop()
 
+	cfg := config.Load()
+
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
-
-	openSearchClient := indexer.NewClient(
-		cfg.OpenSearchURL,
-		indexer.NewHTTPClient(10*time.Second),
-	)
-
-	openSearchContext, openSearchCancel := context.WithTimeout(
-		ctx,
-		15*time.Second,
-	)
-	defer openSearchCancel()
-
-	if err := openSearchClient.Ping(openSearchContext); err != nil {
-		log.Fatalf("OpenSearch connection failed: %v", err)
-	}
-
-	if err := openSearchClient.EnsurePagesIndex(
-		openSearchContext,
-	); err != nil {
-		log.Fatalf("failed to initialize OpenSearch index: %v", err)
-	}
 
 	frontierService := frontier.New(
 		redisClient,
@@ -64,11 +49,27 @@ func main() {
 		}
 	}()
 
-	startupContext, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	startupContext, startupCancel := context.WithTimeout(
+		ctx,
+		startupTimeout,
+	)
+	defer startupCancel()
 
 	if err := frontierService.Ping(startupContext); err != nil {
 		log.Fatalf("Redis connection failed: %v", err)
+	}
+
+	openSearchClient := indexer.NewClient(
+		cfg.OpenSearchURL,
+		indexer.NewHTTPClient(requestTimeout),
+	)
+
+	if err := openSearchClient.Ping(startupContext); err != nil {
+		log.Fatalf("OpenSearch connection failed: %v", err)
+	}
+
+	if err := openSearchClient.EnsurePagesIndex(startupContext); err != nil {
+		log.Fatalf("failed to initialize OpenSearch pages index: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -87,17 +88,20 @@ func main() {
 	frontierHandler := apiHandlers.NewFrontierHandler(frontierService)
 	frontierHandler.RegisterRoutes(mux)
 
-	searchHandler := apiHandlers.NewSearchHandler(
-		openSearchClient,
-	)
+	searchHandler := apiHandlers.NewSearchHandler(openSearchClient)
 	searchHandler.RegisterRoutes(mux)
+
+	handler := apiHandlers.CORS(
+		"http://localhost:5173",
+		mux,
+	)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.APIPort,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -111,12 +115,11 @@ func main() {
 	}()
 
 	<-ctx.Done()
-
 	log.Println("API shutdown requested")
 
 	shutdownContext, shutdownCancel := context.WithTimeout(
 		context.Background(),
-		10*time.Second,
+		shutdownTimeout,
 	)
 	defer shutdownCancel()
 
