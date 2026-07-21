@@ -33,7 +33,7 @@ type Client struct {
 	httpClient       *http.Client
 	validator        *security.DestinationValidator
 	robots           *RobotsManager
-	limiter          *DomainLimiter
+	limiter          RateLimiter
 	userAgent        string
 	maxResponseBytes int64
 }
@@ -41,7 +41,7 @@ type Client struct {
 func NewClient(
 	httpClient *http.Client,
 	validator *security.DestinationValidator,
-	limiter *DomainLimiter,
+	limiter RateLimiter,
 	userAgent string,
 	maxResponseBytes int64,
 ) *Client {
@@ -78,7 +78,10 @@ func (c *Client) Fetch(
 	}
 
 	if err := c.limiter.Wait(ctx, targetURL); err != nil {
-		return FetchResult{}, fmt.Errorf("wait for domain rate limit: %w", err)
+		return FetchResult{}, fmt.Errorf(
+			"wait for domain rate limit: %w",
+			err,
+		)
 	}
 
 	request, err := http.NewRequestWithContext(
@@ -134,7 +137,10 @@ func (c *Client) Fetch(
 
 	body, err := io.ReadAll(limitedReader)
 	if err != nil {
-		return FetchResult{}, fmt.Errorf("read response body: %w", err)
+		return FetchResult{}, fmt.Errorf(
+			"read response body: %w",
+			err,
+		)
 	}
 
 	if int64(len(body)) > c.maxResponseBytes {

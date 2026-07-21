@@ -2,48 +2,107 @@ package crawler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
-	"sync"
+	"strings"
 	"time"
 
-	"golang.org/x/time/rate"
+	"github.com/redis/go-redis/v9"
 )
 
-type DomainLimiter struct {
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-	interval time.Duration
+type RateLimiter interface {
+	Wait(ctx context.Context, targetURL *url.URL) error
 }
 
-func NewDomainLimiter(interval time.Duration) *DomainLimiter {
+type RedisDomainLimiter struct {
+	client   *redis.Client
+	interval time.Duration
+	prefix   string
+}
+
+var acquireDomainSlotScript = redis.NewScript(`
+	local key = KEYS[1]
+	local ttl = tonumber(ARGV[1])
+
+	if redis.call("SET", key, "1", "NX", "PX", ttl) then
+		return 1
+	end
+
+	return redis.call("PTTL", key)
+`)
+
+func NewRedisDomainLimiter(
+	client *redis.Client,
+	interval time.Duration,
+) *RedisDomainLimiter {
 	if interval <= 0 {
 		interval = time.Second
 	}
 
-	return &DomainLimiter{
-		limiters: make(map[string]*rate.Limiter),
+	return &RedisDomainLimiter{
+		client:   client,
 		interval: interval,
+		prefix:   "crawler:domain-limit:",
 	}
 }
 
-func (l *DomainLimiter) Wait(
+func (l *RedisDomainLimiter) Wait(
 	ctx context.Context,
 	targetURL *url.URL,
 ) error {
-	hostname := targetURL.Hostname()
-
-	l.mu.Lock()
-
-	limiter, exists := l.limiters[hostname]
-	if !exists {
-		limiter = rate.NewLimiter(
-			rate.Every(l.interval),
-			1,
-		)
-		l.limiters[hostname] = limiter
+	if targetURL == nil {
+		return errors.New("rate limiter target URL is nil")
 	}
 
-	l.mu.Unlock()
+	hostname := strings.ToLower(
+		strings.TrimSpace(targetURL.Hostname()),
+	)
+	if hostname == "" {
+		return errors.New("rate limiter target URL has no hostname")
+	}
 
-	return limiter.Wait(ctx)
+	key := l.prefix + hostname
+	ttlMilliseconds := l.interval.Milliseconds()
+
+	if ttlMilliseconds < 1 {
+		ttlMilliseconds = 1
+	}
+
+	for {
+		result, err := acquireDomainSlotScript.Run(
+			ctx,
+			l.client,
+			[]string{key},
+			ttlMilliseconds,
+		).Int64()
+		if err != nil {
+			return fmt.Errorf(
+				"acquire Redis domain rate-limit slot: %w",
+				err,
+			)
+		}
+
+		if result == 1 {
+			return nil
+		}
+
+		waitDuration := time.Duration(result) * time.Millisecond
+		if waitDuration <= 0 || waitDuration > l.interval {
+			waitDuration = 50 * time.Millisecond
+		}
+
+		timer := time.NewTimer(waitDuration)
+
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+
+			return ctx.Err()
+
+		case <-timer.C:
+		}
+	}
 }

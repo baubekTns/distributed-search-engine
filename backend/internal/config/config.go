@@ -8,9 +8,11 @@ import (
 )
 
 type Config struct {
-	APIPort                  string
-	RedisAddr                string
-	OpenSearchURL            string
+	APIPort       string
+	RedisAddr     string
+	OpenSearchURL string
+	PostgresDSN   string
+
 	CrawlerUserAgent         string
 	CrawlerRequestTimeout    time.Duration
 	CrawlerRequestDelay      time.Duration
@@ -20,26 +22,37 @@ type Config struct {
 	CrawlerMaxDepth          int
 	CrawlerMaxPagesPerDomain int
 	CrawlerMaxRetries        int
-	PostgresDSN              string
+	CrawlerWorkerCount       int
 }
 
 func Load() Config {
 	redisHost := getEnv("REDIS_HOST", "localhost")
 	redisPort := getEnv("REDIS_PORT", "6379")
+
 	postgresHost := getEnv("POSTGRES_HOST", "localhost")
 	postgresPort := getEnv("POSTGRES_PORT", "5432")
 	postgresDatabase := getEnv("POSTGRES_DB", "search_engine")
 	postgresUser := getEnv("POSTGRES_USER", "search_user")
-	postgresPassword := getEnv("POSTGRES_PASSWORD", "search_password")
-	openSearchURL := getEnv(
-		"OPENSEARCH_URL",
-		"http://localhost:9200",
+	postgresPassword := getEnv(
+		"POSTGRES_PASSWORD",
+		"search_password",
 	)
 
 	return Config{
-		APIPort:       getEnv("API_PORT", "8080"),
-		RedisAddr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
-		OpenSearchURL: openSearchURL,
+		APIPort:   getEnv("API_PORT", "8080"),
+		RedisAddr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+		OpenSearchURL: getEnv(
+			"OPENSEARCH_URL",
+			"http://localhost:9200",
+		),
+		PostgresDSN: fmt.Sprintf(
+			"postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			postgresUser,
+			postgresPassword,
+			postgresHost,
+			postgresPort,
+			postgresDatabase,
+		),
 
 		CrawlerUserAgent: getEnv(
 			"CRAWLER_USER_AGENT",
@@ -52,7 +65,10 @@ func Load() Config {
 			getEnvInt("CRAWLER_REQUEST_DELAY_SECONDS", 2),
 		) * time.Second,
 		CrawlerMaxResponseBytes: int64(
-			getEnvInt("CRAWLER_MAX_RESPONSE_BYTES", 5*1024*1024),
+			getEnvInt(
+				"CRAWLER_MAX_RESPONSE_BYTES",
+				5*1024*1024,
+			),
 		),
 		CrawlerMaxRedirects: getEnvInt(
 			"CRAWLER_MAX_REDIRECTS",
@@ -74,13 +90,9 @@ func Load() Config {
 			"CRAWLER_MAX_RETRIES",
 			2,
 		),
-		PostgresDSN: fmt.Sprintf(
-			"postgres://%s:%s@%s:%s/%s?sslmode=disable",
-			postgresUser,
-			postgresPassword,
-			postgresHost,
-			postgresPort,
-			postgresDatabase,
+		CrawlerWorkerCount: getEnvInt(
+			"CRAWLER_WORKER_COUNT",
+			4,
 		),
 	}
 }
