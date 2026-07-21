@@ -17,18 +17,22 @@ import (
 	"github.com/baubekTns/distributed-search-engine/backend/internal/config"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/crawler"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/frontier"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/indexer"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/parser"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/repository"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/security"
 )
 
 const (
-	redisStartupTimeout    = 5 * time.Second
-	databaseStartupTimeout = 10 * time.Second
-	dequeueTimeout         = 5 * time.Second
-	jobTimeout             = 20 * time.Second
-	retryErrorDelay        = time.Second
-	migrationPath          = "/app/migrations/001_create_pages.sql"
+	redisStartupTimeout      = 5 * time.Second
+	databaseStartupTimeout   = 10 * time.Second
+	openSearchStartupTimeout = 15 * time.Second
+	openSearchRequestTimeout = 10 * time.Second
+	dequeueTimeout           = 5 * time.Second
+	jobTimeout               = 20 * time.Second
+	retryErrorDelay          = time.Second
+
+	migrationPath = "/app/migrations/001_create_pages.sql"
 )
 
 func main() {
@@ -53,7 +57,15 @@ func main() {
 
 	pageRepository := repository.NewPageRepository(databasePool)
 
-	validator := security.NewDestinationValidator(net.DefaultResolver)
+	openSearchClient := createOpenSearchClient(
+		ctx,
+		cfg.OpenSearchURL,
+	)
+
+	validator := security.NewDestinationValidator(
+		net.DefaultResolver,
+	)
+
 	transport := crawler.NewSafeTransport(validator)
 	defer transport.CloseIdleConnections()
 
@@ -86,6 +98,7 @@ func main() {
 		crawlerClient,
 		pageParser,
 		pageRepository,
+		openSearchClient,
 		cfg.CrawlerMaxDepth,
 		cfg.CrawlerMaxRetries,
 	)
@@ -156,6 +169,41 @@ func createDatabase(
 	return databasePool
 }
 
+func createOpenSearchClient(
+	ctx context.Context,
+	openSearchURL string,
+) *indexer.Client {
+	httpClient := indexer.NewHTTPClient(
+		openSearchRequestTimeout,
+	)
+
+	openSearchClient := indexer.NewClient(
+		openSearchURL,
+		httpClient,
+	)
+
+	startupContext, cancel := context.WithTimeout(
+		ctx,
+		openSearchStartupTimeout,
+	)
+	defer cancel()
+
+	if err := openSearchClient.Ping(startupContext); err != nil {
+		log.Fatalf("OpenSearch connection failed: %v", err)
+	}
+
+	if err := openSearchClient.EnsurePagesIndex(
+		startupContext,
+	); err != nil {
+		log.Fatalf(
+			"failed to initialize OpenSearch pages index: %v",
+			err,
+		)
+	}
+
+	return openSearchClient
+}
+
 func createRedirectValidator(
 	validator *security.DestinationValidator,
 	maxRedirects int,
@@ -183,6 +231,7 @@ func runWorker(
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
 	pageRepository *repository.PageRepository,
+	openSearchClient *indexer.Client,
 	maxDepth int,
 	maxRetries int,
 ) {
@@ -217,6 +266,7 @@ func runWorker(
 			crawlerClient,
 			pageParser,
 			pageRepository,
+			openSearchClient,
 			maxDepth,
 			maxRetries,
 		)
@@ -230,6 +280,7 @@ func processJob(
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
 	pageRepository *repository.PageRepository,
+	openSearchClient *indexer.Client,
 	maxDepth int,
 	maxRetries int,
 ) {
@@ -271,7 +322,11 @@ func processJob(
 			result.ContentType,
 		)
 
-		markJobCompleted(ctx, frontierService, job)
+		markJobCompleted(
+			ctx,
+			frontierService,
+			job,
+		)
 		return
 	}
 
@@ -304,15 +359,36 @@ func processJob(
 		job.Depth,
 	)
 
-	if err := storePage(
-		ctx,
+	storedPage, err := storePage(
+		jobContext,
 		job,
 		result,
 		parsedPage,
 		pageRepository,
-	); err != nil {
+	)
+	if err != nil {
 		log.Printf(
 			"failed to store page %s: %v",
+			job.URL,
+			err,
+		)
+
+		markJobFailed(
+			ctx,
+			frontierService,
+			job,
+			err,
+		)
+		return
+	}
+
+	if err := indexPage(
+		jobContext,
+		storedPage,
+		openSearchClient,
+	); err != nil {
+		log.Printf(
+			"failed to index page %s: %v",
 			job.URL,
 			err,
 		)
@@ -341,7 +417,11 @@ func processJob(
 		)
 	}
 
-	markJobCompleted(ctx, frontierService, job)
+	markJobCompleted(
+		ctx,
+		frontierService,
+		job,
+	)
 }
 
 func storePage(
@@ -350,8 +430,10 @@ func storePage(
 	result crawler.FetchResult,
 	parsedPage parser.Page,
 	pageRepository *repository.PageRepository,
-) error {
-	contentHash := parser.ContentHash(parsedPage.Text)
+) (repository.Page, error) {
+	contentHash := parser.ContentHash(
+		parsedPage.Text,
+	)
 
 	existingPage, duplicateContent, err :=
 		pageRepository.FindByContentHash(
@@ -359,7 +441,7 @@ func storePage(
 			contentHash,
 		)
 	if err != nil {
-		return err
+		return repository.Page{}, err
 	}
 
 	if duplicateContent && existingPage.URL != job.URL {
@@ -373,7 +455,7 @@ func storePage(
 
 	pageID, err := repository.NewUUID()
 	if err != nil {
-		return err
+		return repository.Page{}, err
 	}
 
 	storedPage := repository.NewPage(
@@ -393,14 +475,50 @@ func storePage(
 		ctx,
 		storedPage,
 	); err != nil {
+		return repository.Page{}, err
+	}
+
+	log.Printf(
+		"stored page URL=%s page_id=%s hash=%s duplicate_content=%t",
+		job.URL,
+		storedPage.ID,
+		contentHash,
+		duplicateContent,
+	)
+
+	return storedPage, nil
+}
+
+func indexPage(
+	ctx context.Context,
+	page repository.Page,
+	openSearchClient *indexer.Client,
+) error {
+	document := indexer.Document{
+		ID:          page.ID,
+		URL:         page.URL,
+		FinalURL:    page.FinalURL,
+		Title:       page.Title,
+		Content:     page.Content,
+		ContentType: page.ContentType,
+		StatusCode:  page.StatusCode,
+		ContentHash: page.ContentHash,
+		CrawlDepth:  page.CrawlDepth,
+		SourceURL:   page.SourceURL,
+		CrawledAt:   page.CrawledAt,
+	}
+
+	if err := openSearchClient.IndexDocument(
+		ctx,
+		document,
+	); err != nil {
 		return err
 	}
 
 	log.Printf(
-		"stored page URL=%s hash=%s duplicate_content=%t",
-		job.URL,
-		contentHash,
-		duplicateContent,
+		"indexed page URL=%s document_id=%s",
+		page.URL,
+		page.ID,
 	)
 
 	return nil
@@ -465,7 +583,10 @@ func handleFetchFailure(
 	frontierService *frontier.Frontier,
 	maxRetries int,
 ) {
-	logFetchError(job.URL, err)
+	logFetchError(
+		job.URL,
+		err,
+	)
 
 	if shouldRetry(err) && job.Retry < maxRetries {
 		job.Retry++

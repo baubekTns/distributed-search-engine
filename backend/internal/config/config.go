@@ -8,9 +8,9 @@ import (
 )
 
 type Config struct {
-	APIPort   string
-	RedisAddr string
-
+	APIPort                  string
+	RedisAddr                string
+	OpenSearchURL            string
 	CrawlerUserAgent         string
 	CrawlerRequestTimeout    time.Duration
 	CrawlerRequestDelay      time.Duration
@@ -31,10 +31,15 @@ func Load() Config {
 	postgresDatabase := getEnv("POSTGRES_DB", "search_engine")
 	postgresUser := getEnv("POSTGRES_USER", "search_user")
 	postgresPassword := getEnv("POSTGRES_PASSWORD", "search_password")
+	openSearchURL := getEnv(
+		"OPENSEARCH_URL",
+		"http://localhost:9200",
+	)
 
 	return Config{
-		APIPort:   getEnv("API_PORT", "8080"),
-		RedisAddr: fmt.Sprintf("%s:%s", redisHost, redisPort),
+		APIPort:       getEnv("API_PORT", "8080"),
+		RedisAddr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
+		OpenSearchURL: openSearchURL,
 
 		CrawlerUserAgent: getEnv(
 			"CRAWLER_USER_AGENT",

@@ -16,6 +16,7 @@ import (
 	apiHandlers "github.com/baubekTns/distributed-search-engine/backend/internal/api"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/config"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/frontier"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/indexer"
 )
 
 func main() {
@@ -31,6 +32,27 @@ func main() {
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
+
+	openSearchClient := indexer.NewClient(
+		cfg.OpenSearchURL,
+		indexer.NewHTTPClient(10*time.Second),
+	)
+
+	openSearchContext, openSearchCancel := context.WithTimeout(
+		ctx,
+		15*time.Second,
+	)
+	defer openSearchCancel()
+
+	if err := openSearchClient.Ping(openSearchContext); err != nil {
+		log.Fatalf("OpenSearch connection failed: %v", err)
+	}
+
+	if err := openSearchClient.EnsurePagesIndex(
+		openSearchContext,
+	); err != nil {
+		log.Fatalf("failed to initialize OpenSearch index: %v", err)
+	}
 
 	frontierService := frontier.New(
 		redisClient,
@@ -64,6 +86,11 @@ func main() {
 
 	frontierHandler := apiHandlers.NewFrontierHandler(frontierService)
 	frontierHandler.RegisterRoutes(mux)
+
+	searchHandler := apiHandlers.NewSearchHandler(
+		openSearchClient,
+	)
+	searchHandler.RegisterRoutes(mux)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.APIPort,

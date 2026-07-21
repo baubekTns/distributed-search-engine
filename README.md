@@ -99,11 +99,12 @@ React Search Interface
 
 ### Phase 5 — Indexing and search
 
-- [ ] Create OpenSearch document index
-- [ ] Index cleaned page content
-- [ ] Add BM25 full-text search
-- [ ] Generate highlighted result snippets
-- [ ] Add pagination and filters
+- [x] Create OpenSearch document index
+- [x] Index cleaned page content
+- [x] Add BM25 full-text search
+- [x] Generate highlighted result snippets
+- [x] Add pagination parameters
+- [ ] Add domain and date filters
 
 ### Phase 6 — Frontend
 
