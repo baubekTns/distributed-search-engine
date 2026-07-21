@@ -81,21 +81,21 @@ React Search Interface
 
 ### Phase 3 — Safe crawler
 
-- [ ] Download pages concurrently
-- [ ] Add per-domain rate limiting
-- [ ] Respect robots.txt
-- [ ] Block private and local IP addresses
-- [ ] Validate redirects
-- [ ] Restrict response types and sizes
-- [ ] Add timeout and retry handling
+- [x] Download pages concurrently
+- [x] Add per-domain rate limiting
+- [x] Respect robots.txt
+- [x] Block private and local IP addresses
+- [x] Validate redirects
+- [x] Restrict response types and sizes
+- [x] Add timeout and retry handling
 
 ### Phase 4 — Parsing and storage
 
 - [x] Extract page titles and visible text
 - [x] Extract and normalise outgoing links
-- [ ] Generate content hashes
-- [ ] Detect duplicate pages
-- [ ] Store page metadata in PostgreSQL
+- [x] Generate content hashes
+- [x] Detect duplicate page content
+- [x] Store page metadata in PostgreSQL
 
 ### Phase 5 — Indexing and search
 

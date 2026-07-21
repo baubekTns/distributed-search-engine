@@ -20,11 +20,17 @@ type Config struct {
 	CrawlerMaxDepth          int
 	CrawlerMaxPagesPerDomain int
 	CrawlerMaxRetries        int
+	PostgresDSN              string
 }
 
 func Load() Config {
 	redisHost := getEnv("REDIS_HOST", "localhost")
 	redisPort := getEnv("REDIS_PORT", "6379")
+	postgresHost := getEnv("POSTGRES_HOST", "localhost")
+	postgresPort := getEnv("POSTGRES_PORT", "5432")
+	postgresDatabase := getEnv("POSTGRES_DB", "search_engine")
+	postgresUser := getEnv("POSTGRES_USER", "search_user")
+	postgresPassword := getEnv("POSTGRES_PASSWORD", "search_password")
 
 	return Config{
 		APIPort:   getEnv("API_PORT", "8080"),
@@ -62,6 +68,14 @@ func Load() Config {
 		CrawlerMaxRetries: getEnvInt(
 			"CRAWLER_MAX_RETRIES",
 			2,
+		),
+		PostgresDSN: fmt.Sprintf(
+			"postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			postgresUser,
+			postgresPassword,
+			postgresHost,
+			postgresPort,
+			postgresDatabase,
 		),
 	}
 }

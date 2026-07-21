@@ -11,13 +11,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/baubekTns/distributed-search-engine/backend/internal/config"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/crawler"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/frontier"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/parser"
+	"github.com/baubekTns/distributed-search-engine/backend/internal/repository"
 	"github.com/baubekTns/distributed-search-engine/backend/internal/security"
+)
+
+const (
+	redisStartupTimeout    = 5 * time.Second
+	databaseStartupTimeout = 10 * time.Second
+	dequeueTimeout         = 5 * time.Second
+	jobTimeout             = 20 * time.Second
+	retryErrorDelay        = time.Second
+	migrationPath          = "/app/migrations/001_create_pages.sql"
 )
 
 func main() {
@@ -30,54 +41,29 @@ func main() {
 
 	cfg := config.Load()
 
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisAddr,
-	})
-
-	frontierService := frontier.New(
-		redisClient,
-		cfg.CrawlerMaxPagesPerDomain,
-	)
+	frontierService := createFrontier(ctx, cfg)
 	defer func() {
 		if err := frontierService.Close(); err != nil {
 			log.Printf("failed to close Redis client: %v", err)
 		}
 	}()
 
-	startupContext, startupCancel := context.WithTimeout(
-		ctx,
-		5*time.Second,
-	)
-	defer startupCancel()
+	databasePool := createDatabase(ctx, cfg.PostgresDSN)
+	defer databasePool.Close()
 
-	if err := frontierService.Ping(startupContext); err != nil {
-		log.Fatalf("Redis connection failed: %v", err)
-	}
+	pageRepository := repository.NewPageRepository(databasePool)
 
-	validator := security.NewDestinationValidator(
-		net.DefaultResolver,
-	)
-
+	validator := security.NewDestinationValidator(net.DefaultResolver)
 	transport := crawler.NewSafeTransport(validator)
+	defer transport.CloseIdleConnections()
 
 	httpClient := &http.Client{
 		Transport: transport,
 		Timeout:   cfg.CrawlerRequestTimeout,
-		CheckRedirect: func(
-			request *http.Request,
-			previous []*http.Request,
-		) error {
-			if len(previous) >= cfg.CrawlerMaxRedirects {
-				return crawler.ErrTooManyRedirects
-			}
-
-			_, err := validator.Validate(
-				request.Context(),
-				request.URL,
-			)
-
-			return err
-		},
+		CheckRedirect: createRedirectValidator(
+			validator,
+			cfg.CrawlerMaxRedirects,
+		),
 	}
 
 	crawlerClient := crawler.NewClient(
@@ -99,13 +85,96 @@ func main() {
 		frontierService,
 		crawlerClient,
 		pageParser,
+		pageRepository,
 		cfg.CrawlerMaxDepth,
 		cfg.CrawlerMaxRetries,
 	)
 
-	transport.CloseIdleConnections()
-
 	log.Println("crawler worker stopped")
+}
+
+func createFrontier(
+	ctx context.Context,
+	cfg config.Config,
+) *frontier.Frontier {
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: cfg.RedisAddr,
+	})
+
+	frontierService := frontier.New(
+		redisClient,
+		cfg.CrawlerMaxPagesPerDomain,
+	)
+
+	startupContext, cancel := context.WithTimeout(
+		ctx,
+		redisStartupTimeout,
+	)
+	defer cancel()
+
+	if err := frontierService.Ping(startupContext); err != nil {
+		if closeErr := frontierService.Close(); closeErr != nil {
+			log.Printf(
+				"failed to close Redis client after startup failure: %v",
+				closeErr,
+			)
+		}
+
+		log.Fatalf("Redis connection failed: %v", err)
+	}
+
+	return frontierService
+}
+
+func createDatabase(
+	ctx context.Context,
+	postgresDSN string,
+) *pgxpool.Pool {
+	startupContext, cancel := context.WithTimeout(
+		ctx,
+		databaseStartupTimeout,
+	)
+	defer cancel()
+
+	databasePool, err := repository.OpenDatabase(
+		startupContext,
+		postgresDSN,
+	)
+	if err != nil {
+		log.Fatalf("PostgreSQL connection failed: %v", err)
+	}
+
+	if err := repository.RunMigration(
+		startupContext,
+		databasePool,
+		migrationPath,
+	); err != nil {
+		databasePool.Close()
+		log.Fatalf("database migration failed: %v", err)
+	}
+
+	return databasePool
+}
+
+func createRedirectValidator(
+	validator *security.DestinationValidator,
+	maxRedirects int,
+) func(*http.Request, []*http.Request) error {
+	return func(
+		request *http.Request,
+		previous []*http.Request,
+	) error {
+		if len(previous) >= maxRedirects {
+			return crawler.ErrTooManyRedirects
+		}
+
+		_, err := validator.Validate(
+			request.Context(),
+			request.URL,
+		)
+
+		return err
+	}
 }
 
 func runWorker(
@@ -113,6 +182,7 @@ func runWorker(
 	frontierService *frontier.Frontier,
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
+	pageRepository *repository.PageRepository,
 	maxDepth int,
 	maxRetries int,
 ) {
@@ -124,7 +194,7 @@ func runWorker(
 
 		job, err := frontierService.Dequeue(
 			ctx,
-			5*time.Second,
+			dequeueTimeout,
 		)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -132,7 +202,7 @@ func runWorker(
 			}
 
 			log.Printf("failed to retrieve crawl job: %v", err)
-			time.Sleep(time.Second)
+			time.Sleep(retryErrorDelay)
 			continue
 		}
 
@@ -146,6 +216,7 @@ func runWorker(
 			frontierService,
 			crawlerClient,
 			pageParser,
+			pageRepository,
 			maxDepth,
 			maxRetries,
 		)
@@ -158,51 +229,28 @@ func processJob(
 	frontierService *frontier.Frontier,
 	crawlerClient *crawler.Client,
 	pageParser *parser.HTMLParser,
+	pageRepository *repository.PageRepository,
 	maxDepth int,
 	maxRetries int,
 ) {
-	fetchContext, cancel := context.WithTimeout(
+	jobContext, cancel := context.WithTimeout(
 		ctx,
-		20*time.Second,
+		jobTimeout,
 	)
 	defer cancel()
 
 	result, err := crawlerClient.Fetch(
-		fetchContext,
+		jobContext,
 		job.URL,
 	)
 	if err != nil {
-		logFetchError(job.URL, err)
-
-		if shouldRetry(err) && job.Retry < maxRetries {
-			job.Retry++
-
-			if requeueErr := frontierService.Requeue(
-				ctx,
-				job,
-			); requeueErr != nil {
-				log.Printf(
-					"failed to requeue %s: %v",
-					job.URL,
-					requeueErr,
-				)
-			}
-
-			return
-		}
-
-		if markErr := frontierService.MarkFailed(
+		handleFetchFailure(
 			ctx,
 			job,
-			err.Error(),
-		); markErr != nil {
-			log.Printf(
-				"failed to mark job failed %s: %v",
-				job.URL,
-				markErr,
-			)
-		}
-
+			err,
+			frontierService,
+			maxRetries,
+		)
 		return
 	}
 
@@ -216,67 +264,146 @@ func processJob(
 		len(result.Body),
 	)
 
-	if parser.SupportsContentType(result.ContentType) {
-		parsedPage, parseErr := pageParser.Parse(
-			result.FinalURL,
-			result.Body,
-		)
-		if parseErr != nil {
-			log.Printf(
-				"failed to parse page %s: %v",
-				result.FinalURL,
-				parseErr,
-			)
-
-			if markErr := frontierService.MarkFailed(
-				ctx,
-				job,
-				parseErr.Error(),
-			); markErr != nil {
-				log.Printf(
-					"failed to mark job failed: %v",
-					markErr,
-				)
-			}
-
-			return
-		}
-
+	if !parser.SupportsContentType(result.ContentType) {
 		log.Printf(
-			"parsed URL=%s title=%q text_bytes=%d links=%d depth=%d",
-			parsedPage.URL,
-			parsedPage.Title,
-			len(parsedPage.Text),
-			len(parsedPage.Links),
-			job.Depth,
+			"content type does not require HTML parsing: URL=%s type=%s",
+			result.FinalURL,
+			result.ContentType,
 		)
 
-		if job.Depth < maxDepth {
-			enqueueDiscoveredLinks(
-				ctx,
-				job,
-				parsedPage,
-				frontierService,
-			)
-		} else {
-			log.Printf(
-				"maximum crawl depth reached URL=%s depth=%d",
-				job.URL,
-				job.Depth,
-			)
-		}
+		markJobCompleted(ctx, frontierService, job)
+		return
 	}
 
-	if err := frontierService.MarkCompleted(
+	parsedPage, err := pageParser.Parse(
+		result.FinalURL,
+		result.Body,
+	)
+	if err != nil {
+		log.Printf(
+			"failed to parse page %s: %v",
+			result.FinalURL,
+			err,
+		)
+
+		markJobFailed(
+			ctx,
+			frontierService,
+			job,
+			err,
+		)
+		return
+	}
+
+	log.Printf(
+		"parsed URL=%s title=%q text_bytes=%d links=%d depth=%d",
+		parsedPage.URL,
+		parsedPage.Title,
+		len(parsedPage.Text),
+		len(parsedPage.Links),
+		job.Depth,
+	)
+
+	if err := storePage(
 		ctx,
 		job,
+		result,
+		parsedPage,
+		pageRepository,
 	); err != nil {
 		log.Printf(
-			"failed to mark job completed %s: %v",
+			"failed to store page %s: %v",
 			job.URL,
 			err,
 		)
+
+		markJobFailed(
+			ctx,
+			frontierService,
+			job,
+			err,
+		)
+		return
 	}
+
+	if job.Depth < maxDepth {
+		enqueueDiscoveredLinks(
+			ctx,
+			job,
+			parsedPage,
+			frontierService,
+		)
+	} else {
+		log.Printf(
+			"maximum crawl depth reached URL=%s depth=%d",
+			job.URL,
+			job.Depth,
+		)
+	}
+
+	markJobCompleted(ctx, frontierService, job)
+}
+
+func storePage(
+	ctx context.Context,
+	job frontier.Job,
+	result crawler.FetchResult,
+	parsedPage parser.Page,
+	pageRepository *repository.PageRepository,
+) error {
+	contentHash := parser.ContentHash(parsedPage.Text)
+
+	existingPage, duplicateContent, err :=
+		pageRepository.FindByContentHash(
+			ctx,
+			contentHash,
+		)
+	if err != nil {
+		return err
+	}
+
+	if duplicateContent && existingPage.URL != job.URL {
+		log.Printf(
+			"duplicate page content URL=%s existing_url=%s hash=%s",
+			job.URL,
+			existingPage.URL,
+			contentHash,
+		)
+	}
+
+	pageID, err := repository.NewUUID()
+	if err != nil {
+		return err
+	}
+
+	storedPage := repository.NewPage(
+		pageID,
+		job.URL,
+		result.FinalURL,
+		parsedPage.Title,
+		parsedPage.Text,
+		result.ContentType,
+		result.StatusCode,
+		contentHash,
+		job.Depth,
+		job.SourceURL,
+	)
+
+	if err := pageRepository.Save(
+		ctx,
+		storedPage,
+	); err != nil {
+		return err
+	}
+
+	log.Printf(
+		"stored page URL=%s hash=%s duplicate_content=%t",
+		job.URL,
+		contentHash,
+		duplicateContent,
+	)
+
+	return nil
 }
 
 func enqueueDiscoveredLinks(
@@ -301,7 +428,6 @@ func enqueueDiscoveredLinks(
 			ctx,
 			discoveredJob,
 		)
-
 		if err != nil {
 			rejectedCount++
 
@@ -332,7 +458,121 @@ func enqueueDiscoveredLinks(
 	)
 }
 
-func logFetchError(targetURL string, err error) {
+func handleFetchFailure(
+	ctx context.Context,
+	job frontier.Job,
+	err error,
+	frontierService *frontier.Frontier,
+	maxRetries int,
+) {
+	logFetchError(job.URL, err)
+
+	if shouldRetry(err) && job.Retry < maxRetries {
+		job.Retry++
+
+		if requeueErr := frontierService.Requeue(
+			ctx,
+			job,
+		); requeueErr != nil {
+			log.Printf(
+				"failed to requeue URL=%s retry=%d: %v",
+				job.URL,
+				job.Retry,
+				requeueErr,
+			)
+
+			markJobFailed(
+				ctx,
+				frontierService,
+				job,
+				requeueErr,
+			)
+			return
+		}
+
+		log.Printf(
+			"requeued URL=%s retry=%d max_retries=%d",
+			job.URL,
+			job.Retry,
+			maxRetries,
+		)
+
+		return
+	}
+
+	markJobFailed(
+		ctx,
+		frontierService,
+		job,
+		err,
+	)
+}
+
+func markJobCompleted(
+	ctx context.Context,
+	frontierService *frontier.Frontier,
+	job frontier.Job,
+) {
+	if err := frontierService.MarkCompleted(
+		ctx,
+		job,
+	); err != nil {
+		log.Printf(
+			"failed to mark job completed URL=%s: %v",
+			job.URL,
+			err,
+		)
+	}
+}
+
+func markJobFailed(
+	ctx context.Context,
+	frontierService *frontier.Frontier,
+	job frontier.Job,
+	err error,
+) {
+	if markErr := frontierService.MarkFailed(
+		ctx,
+		job,
+		err.Error(),
+	); markErr != nil {
+		log.Printf(
+			"failed to mark job failed URL=%s: %v",
+			job.URL,
+			markErr,
+		)
+	}
+}
+
+func shouldRetry(err error) bool {
+	switch {
+	case errors.Is(err, crawler.ErrRobotsDenied):
+		return false
+
+	case errors.Is(err, crawler.ErrUnsupportedType):
+		return false
+
+	case errors.Is(err, crawler.ErrResponseTooLarge):
+		return false
+
+	case errors.Is(err, crawler.ErrTooManyRedirects):
+		return false
+
+	case errors.Is(err, security.ErrUnsafeAddress):
+		return false
+
+	case errors.Is(err, context.Canceled):
+		return false
+
+	default:
+		return true
+	}
+}
+
+func logFetchError(
+	targetURL string,
+	err error,
+) {
 	switch {
 	case errors.Is(err, crawler.ErrRobotsDenied):
 		log.Printf(
@@ -382,30 +622,5 @@ func logFetchError(targetURL string, err error) {
 			targetURL,
 			err,
 		)
-	}
-}
-
-func shouldRetry(err error) bool {
-	switch {
-	case errors.Is(err, crawler.ErrRobotsDenied):
-		return false
-
-	case errors.Is(err, crawler.ErrUnsupportedType):
-		return false
-
-	case errors.Is(err, crawler.ErrResponseTooLarge):
-		return false
-
-	case errors.Is(err, crawler.ErrTooManyRedirects):
-		return false
-
-	case errors.Is(err, security.ErrUnsafeAddress):
-		return false
-
-	case errors.Is(err, context.Canceled):
-		return false
-
-	default:
-		return true
 	}
 }

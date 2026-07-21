@@ -22,6 +22,8 @@ WORKDIR /app
 
 COPY --from=builder /app/bin/service /app/service
 
+COPY --from=builder /app/migrations /app/migrations
+
 RUN addgroup -S app && adduser -S app -G app
 USER app
 
