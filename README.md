@@ -82,47 +82,59 @@ React Search Interface
 ### Phase 3 — Safe crawler
 
 - [x] Download pages concurrently
-- [x] Add per-domain rate limiting
+- [x] Add globally coordinated per-domain rate limiting
 - [x] Respect robots.txt
 - [x] Block private and local IP addresses
 - [x] Validate redirects
 - [x] Restrict response types and sizes
 - [x] Add timeout and retry handling
+- [x] Preserve TLS certificate verification
 
 ### Phase 4 — Parsing and storage
 
 - [x] Extract page titles and visible text
 - [x] Extract and normalise outgoing links
+- [x] Restrict discovered links to the same hostname
 - [x] Generate content hashes
 - [x] Detect duplicate page content
-- [x] Store page metadata in PostgreSQL
+- [x] Store page metadata and content in PostgreSQL
 
 ### Phase 5 — Indexing and search
 
 - [x] Create OpenSearch document index
 - [x] Index cleaned page content
 - [x] Add BM25 full-text search
+- [x] Boost title matches
 - [x] Generate highlighted result snippets
 - [x] Add pagination parameters
-- [ ] Add domain and date filters
+- [x] Add domain filters
+- [x] Add crawl-date filters
+- [x] Handle PostgreSQL/OpenSearch consistency failures
 
 ### Phase 6 — Frontend
 
-- [ ] Create search form
-- [ ] Display ranked search results
-- [ ] Add pagination
-- [ ] Display result count and query duration
-- [ ] Add crawler status dashboard
+- [x] Create search form
+- [x] Display ranked search results
+- [x] Add pagination
+- [x] Display result count
+- [x] Display query duration
+- [x] Add crawler status dashboard
+- [x] Display active crawler instances and worker counts
+- [x] Add loading, error and empty-result states
 
 ### Phase 7 — Distributed deployment and monitoring
 
-- [ ] Run multiple crawler workers
-- [ ] Add graceful worker shutdown
-- [ ] Add structured logging
+- [x] Run multiple goroutine workers inside each crawler container
+- [x] Support multiple crawler container replicas
+- [x] Add Redis-backed global domain rate limiting
+- [x] Add graceful worker shutdown
+- [x] Add crawler-instance heartbeats
+- [x] Add stale-instance detection through Redis TTL expiry
+- [x] Add crawler cluster status endpoint
+
+### Future improvements
+
+- [ ] Add structured JSON logging
 - [ ] Add Prometheus metrics
 - [ ] Add Grafana dashboards
-- [ ] Add automated tests and CI
-
-## Development Status
-
-The project is currently in the initial repository and service setup phase.
+- [ ] Add broader integration tests

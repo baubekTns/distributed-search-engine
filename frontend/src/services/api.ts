@@ -1,5 +1,5 @@
 import type { CrawlerStatusResponse } from "../types/crawler";
-import type { SearchResponse } from "../types/search";
+import type { SearchOptions, SearchResponse } from "../types/search";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
 
@@ -8,10 +8,7 @@ async function readError(
   fallback: string,
 ): Promise<string> {
   try {
-    const body = (await response.json()) as {
-      error?: string;
-    };
-
+    const body = (await response.json()) as { error?: string };
     return body.error || fallback;
   } catch {
     return fallback;
@@ -19,31 +16,28 @@ async function readError(
 }
 
 export async function searchPages(
-  query: string,
-  limit = 10,
-  offset = 0,
+  options: SearchOptions,
   signal?: AbortSignal,
 ): Promise<SearchResponse> {
   const params = new URLSearchParams({
-    q: query,
-    limit: String(limit),
-    offset: String(offset),
+    q: options.query,
+    limit: String(options.limit ?? 10),
+    offset: String(options.offset ?? 0),
   });
+  if (options.domain?.trim()) params.set("domain", options.domain.trim());
+  if (options.crawledAfter) params.set("crawled_after", options.crawledAfter);
+  if (options.crawledBefore)
+    params.set("crawled_before", options.crawledBefore);
 
   const response = await fetch(`${API_BASE_URL}/api/v1/search?${params}`, {
     method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
+    headers: { Accept: "application/json" },
     signal,
   });
-
-  if (!response.ok) {
+  if (!response.ok)
     throw new Error(
       await readError(response, `Search failed with HTTP ${response.status}`),
     );
-  }
-
   return (await response.json()) as SearchResponse;
 }
 
@@ -52,20 +46,15 @@ export async function getCrawlerStatus(
 ): Promise<CrawlerStatusResponse> {
   const response = await fetch(`${API_BASE_URL}/api/v1/crawlers`, {
     method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
+    headers: { Accept: "application/json" },
     signal,
   });
-
-  if (!response.ok) {
+  if (!response.ok)
     throw new Error(
       await readError(
         response,
         `Crawler status failed with HTTP ${response.status}`,
       ),
     );
-  }
-
   return (await response.json()) as CrawlerStatusResponse;
 }
