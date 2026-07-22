@@ -36,13 +36,13 @@ const (
 )
 
 type workerDependencies struct {
-	frontierService *frontier.Frontier
-	crawlerClient   *crawler.Client
-	pageParser      *parser.HTMLParser
-	pageRepository  *repository.PageRepository
+	frontierService  *frontier.Frontier
+	crawlerClient    *crawler.Client
+	pageParser       *parser.HTMLParser
+	pageRepository   *repository.PageRepository
 	openSearchClient *indexer.Client
-	maxDepth        int
-	maxRetries      int
+	maxDepth         int
+	maxRetries       int
 }
 
 func main() {
@@ -73,7 +73,9 @@ func main() {
 	databasePool := createDatabase(ctx, cfg.PostgresDSN)
 	defer databasePool.Close()
 
-	pageRepository := repository.NewPageRepository(databasePool)
+	pageRepository := repository.NewPageRepository(
+		databasePool,
+	)
 
 	openSearchClient := createOpenSearchClient(
 		ctx,
@@ -113,6 +115,30 @@ func main() {
 		cfg.CrawlerMaxLinksPerPage,
 	)
 
+	workerCount := cfg.CrawlerWorkerCount
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	instanceID, hostname := resolveInstanceIdentity()
+
+	startedAt := time.Now().UTC()
+
+	heartbeatDone := make(chan struct{})
+
+	go runHeartbeatLoop(
+		ctx,
+		frontierService,
+		frontier.WorkerStatus{
+			InstanceID:  instanceID,
+			Hostname:    hostname,
+			WorkerCount: workerCount,
+			StartedAt:   startedAt,
+		},
+		cfg.CrawlerHeartbeatInterval,
+		heartbeatDone,
+	)
+
 	dependencies := workerDependencies{
 		frontierService:  frontierService,
 		crawlerClient:    crawlerClient,
@@ -123,13 +149,9 @@ func main() {
 		maxRetries:       cfg.CrawlerMaxRetries,
 	}
 
-	workerCount := cfg.CrawlerWorkerCount
-	if workerCount < 1 {
-		workerCount = 1
-	}
-
 	log.Printf(
-		"crawler service started workers=%d domain_delay=%s",
+		"crawler service started instance_id=%s workers=%d domain_delay=%s",
+		instanceID,
 		workerCount,
 		cfg.CrawlerRequestDelay,
 	)
@@ -140,7 +162,87 @@ func main() {
 		dependencies,
 	)
 
+	<-heartbeatDone
+
+	cleanupContext, cleanupCancel := context.WithTimeout(
+		context.Background(),
+		3*time.Second,
+	)
+	defer cleanupCancel()
+
+	if err := frontierService.RemoveWorkerHeartbeat(
+		cleanupContext,
+		instanceID,
+	); err != nil {
+		log.Printf(
+			"failed to remove worker heartbeat: %v",
+			err,
+		)
+	}
+
 	log.Println("crawler service stopped")
+}
+
+func resolveInstanceIdentity() (string, string) {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "unknown-host"
+	}
+
+	return hostname, hostname
+}
+
+func runHeartbeatLoop(
+	ctx context.Context,
+	frontierService *frontier.Frontier,
+	status frontier.WorkerStatus,
+	interval time.Duration,
+	done chan<- struct{},
+) {
+	defer close(done)
+
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+
+	ttl := interval * 3
+
+	record := func() {
+		status.LastSeen = time.Now().UTC()
+
+		heartbeatContext, cancel := context.WithTimeout(
+			ctx,
+			3*time.Second,
+		)
+		defer cancel()
+
+		if err := frontierService.RecordWorkerHeartbeat(
+			heartbeatContext,
+			status,
+			ttl,
+		); err != nil &&
+			ctx.Err() == nil {
+			log.Printf(
+				"failed to record crawler heartbeat: %v",
+				err,
+			)
+		}
+	}
+
+	record()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			record()
+		}
+	}
 }
 
 func createFrontier(
@@ -291,7 +393,10 @@ func runWorker(
 	dependencies workerDependencies,
 ) {
 	log.Printf("crawler worker started worker_id=%d", workerID)
-	defer log.Printf("crawler worker stopped worker_id=%d", workerID)
+	defer log.Printf(
+		"crawler worker stopped worker_id=%d",
+		workerID,
+	)
 
 	for {
 		if ctx.Err() != nil {
@@ -323,14 +428,6 @@ func runWorker(
 		if job.URL == "" {
 			continue
 		}
-
-		log.Printf(
-			"worker accepted job worker_id=%d URL=%s depth=%d retry=%d",
-			workerID,
-			job.URL,
-			job.Depth,
-			job.Retry,
-		)
 
 		processJob(
 			ctx,
@@ -369,25 +466,7 @@ func processJob(
 		return
 	}
 
-	log.Printf(
-		"crawled worker_id=%d URL=%s depth=%d retry=%d status=%d type=%s bytes=%d",
-		workerID,
-		result.FinalURL,
-		job.Depth,
-		job.Retry,
-		result.StatusCode,
-		result.ContentType,
-		len(result.Body),
-	)
-
 	if !parser.SupportsContentType(result.ContentType) {
-		log.Printf(
-			"content type does not require HTML parsing worker_id=%d URL=%s type=%s",
-			workerID,
-			result.FinalURL,
-			result.ContentType,
-		)
-
 		markJobCompleted(
 			ctx,
 			dependencies.frontierService,
@@ -401,13 +480,6 @@ func processJob(
 		result.Body,
 	)
 	if err != nil {
-		log.Printf(
-			"failed to parse page worker_id=%d URL=%s: %v",
-			workerID,
-			result.FinalURL,
-			err,
-		)
-
 		markJobFailed(
 			ctx,
 			dependencies.frontierService,
@@ -425,13 +497,6 @@ func processJob(
 		dependencies.pageRepository,
 	)
 	if err != nil {
-		log.Printf(
-			"failed to store page worker_id=%d URL=%s: %v",
-			workerID,
-			job.URL,
-			err,
-		)
-
 		markJobFailed(
 			ctx,
 			dependencies.frontierService,
@@ -446,13 +511,6 @@ func processJob(
 		storedPage,
 		dependencies.openSearchClient,
 	); err != nil {
-		log.Printf(
-			"failed to index page worker_id=%d URL=%s: %v",
-			workerID,
-			job.URL,
-			err,
-		)
-
 		markJobFailed(
 			ctx,
 			dependencies.frontierService,
@@ -469,19 +527,19 @@ func processJob(
 			parsedPage,
 			dependencies.frontierService,
 		)
-	} else {
-		log.Printf(
-			"maximum crawl depth reached worker_id=%d URL=%s depth=%d",
-			workerID,
-			job.URL,
-			job.Depth,
-		)
 	}
 
 	markJobCompleted(
 		ctx,
 		dependencies.frontierService,
 		job,
+	)
+
+	log.Printf(
+		"job completed worker_id=%d URL=%s depth=%d",
+		workerID,
+		job.URL,
+		job.Depth,
 	)
 }
 
@@ -494,22 +552,12 @@ func storePage(
 ) (repository.Page, error) {
 	contentHash := parser.ContentHash(parsedPage.Text)
 
-	existingPage, duplicateContent, err :=
-		pageRepository.FindByContentHash(
-			ctx,
-			contentHash,
-		)
+	_, _, err := pageRepository.FindByContentHash(
+		ctx,
+		contentHash,
+	)
 	if err != nil {
 		return repository.Page{}, err
-	}
-
-	if duplicateContent && existingPage.URL != job.URL {
-		log.Printf(
-			"duplicate page content URL=%s existing_url=%s hash=%s",
-			job.URL,
-			existingPage.URL,
-			contentHash,
-		)
 	}
 
 	pageID, err := repository.NewUUID()
@@ -534,14 +582,6 @@ func storePage(
 		return repository.Page{}, err
 	}
 
-	log.Printf(
-		"stored page URL=%s page_id=%s hash=%s duplicate_content=%t",
-		job.URL,
-		storedPage.ID,
-		contentHash,
-		duplicateContent,
-	)
-
 	return storedPage, nil
 }
 
@@ -550,31 +590,22 @@ func indexPage(
 	page repository.Page,
 	openSearchClient *indexer.Client,
 ) error {
-	document := indexer.Document{
-		ID:          page.ID,
-		URL:         page.URL,
-		FinalURL:    page.FinalURL,
-		Title:       page.Title,
-		Content:     page.Content,
-		ContentType: page.ContentType,
-		StatusCode:  page.StatusCode,
-		ContentHash: page.ContentHash,
-		CrawlDepth:  page.CrawlDepth,
-		SourceURL:   page.SourceURL,
-		CrawledAt:   page.CrawledAt,
-	}
-
-	if err := openSearchClient.IndexDocument(ctx, document); err != nil {
-		return err
-	}
-
-	log.Printf(
-		"indexed page URL=%s document_id=%s",
-		page.URL,
-		page.ID,
+	return openSearchClient.IndexDocument(
+		ctx,
+		indexer.Document{
+			ID:          page.ID,
+			URL:         page.URL,
+			FinalURL:    page.FinalURL,
+			Title:       page.Title,
+			Content:     page.Content,
+			ContentType: page.ContentType,
+			StatusCode:  page.StatusCode,
+			ContentHash: page.ContentHash,
+			CrawlDepth:  page.CrawlDepth,
+			SourceURL:   page.SourceURL,
+			CrawledAt:   page.CrawledAt,
+		},
 	)
-
-	return nil
 }
 
 func enqueueDiscoveredLinks(
@@ -583,43 +614,16 @@ func enqueueDiscoveredLinks(
 	parsedPage parser.Page,
 	frontierService *frontier.Frontier,
 ) {
-	enqueuedCount := 0
-	duplicateCount := 0
-	rejectedCount := 0
-
 	for _, discoveredURL := range parsedPage.Links {
-		discoveredJob := frontier.Job{
-			URL:       discoveredURL,
-			Depth:     parentJob.Depth + 1,
-			Retry:     0,
-			SourceURL: parentJob.URL,
-		}
-
-		_, added, err := frontierService.EnqueueJob(
+		_, _, _ = frontierService.EnqueueJob(
 			ctx,
-			discoveredJob,
+			frontier.Job{
+				URL:       discoveredURL,
+				Depth:     parentJob.Depth + 1,
+				SourceURL: parentJob.URL,
+			},
 		)
-		if err != nil {
-			rejectedCount++
-			continue
-		}
-
-		if added {
-			enqueuedCount++
-		} else {
-			duplicateCount++
-		}
 	}
-
-	log.Printf(
-		"link discovery URL=%s depth=%d discovered=%d enqueued=%d duplicate=%d rejected=%d",
-		parsedPage.URL,
-		parentJob.Depth,
-		len(parsedPage.Links),
-		enqueuedCount,
-		duplicateCount,
-		rejectedCount,
-	)
 }
 
 func handleFetchFailure(
@@ -630,30 +634,22 @@ func handleFetchFailure(
 	frontierService *frontier.Frontier,
 	maxRetries int,
 ) {
-	logFetchError(workerID, job.URL, err)
+	log.Printf(
+		"crawl failed worker_id=%d URL=%s error=%v",
+		workerID,
+		job.URL,
+		err,
+	)
 
 	if shouldRetry(err) && job.Retry < maxRetries {
 		job.Retry++
 
-		if requeueErr := frontierService.Requeue(ctx, job); requeueErr != nil {
-			markJobFailed(
-				ctx,
-				frontierService,
-				job,
-				requeueErr,
-			)
+		if requeueErr := frontierService.Requeue(
+			ctx,
+			job,
+		); requeueErr == nil {
 			return
 		}
-
-		log.Printf(
-			"requeued worker_id=%d URL=%s retry=%d max_retries=%d",
-			workerID,
-			job.URL,
-			job.Retry,
-			maxRetries,
-		)
-
-		return
 	}
 
 	markJobFailed(
@@ -669,7 +665,10 @@ func markJobCompleted(
 	frontierService *frontier.Frontier,
 	job frontier.Job,
 ) {
-	if err := frontierService.MarkCompleted(ctx, job); err != nil {
+	if err := frontierService.MarkCompleted(
+		ctx,
+		job,
+	); err != nil {
 		log.Printf(
 			"failed to mark job completed URL=%s: %v",
 			job.URL,
@@ -714,19 +713,6 @@ func shouldRetry(err error) bool {
 	default:
 		return true
 	}
-}
-
-func logFetchError(
-	workerID int,
-	targetURL string,
-	err error,
-) {
-	log.Printf(
-		"crawl failed worker_id=%d URL=%s error=%v",
-		workerID,
-		targetURL,
-		err,
-	)
 }
 
 func sleepWithContext(

@@ -68,28 +68,50 @@ func main() {
 		log.Fatalf("OpenSearch connection failed: %v", err)
 	}
 
-	if err := openSearchClient.EnsurePagesIndex(startupContext); err != nil {
-		log.Fatalf("failed to initialize OpenSearch pages index: %v", err)
+	if err := openSearchClient.EnsurePagesIndex(
+		startupContext,
+	); err != nil {
+		log.Fatalf(
+			"failed to initialize OpenSearch pages index: %v",
+			err,
+		)
 	}
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /health", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if err := json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": "search-api",
-		}); err != nil {
-			log.Printf("failed to encode health response: %v", err)
+		if err := json.NewEncoder(w).Encode(
+			map[string]string{
+				"status":  "ok",
+				"service": "search-api",
+			},
+		); err != nil {
+			log.Printf(
+				"failed to encode health response: %v",
+				err,
+			)
 		}
 	})
 
-	frontierHandler := apiHandlers.NewFrontierHandler(frontierService)
+	frontierHandler := apiHandlers.NewFrontierHandler(
+		frontierService,
+	)
 	frontierHandler.RegisterRoutes(mux)
 
-	searchHandler := apiHandlers.NewSearchHandler(openSearchClient)
+	searchHandler := apiHandlers.NewSearchHandler(
+		openSearchClient,
+	)
 	searchHandler.RegisterRoutes(mux)
+
+	workersHandler := apiHandlers.NewWorkersHandler(
+		frontierService,
+	)
+	workersHandler.RegisterRoutes(mux)
 
 	handler := apiHandlers.CORS(
 		"http://localhost:5173",
@@ -106,7 +128,10 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("search API listening on port %s", cfg.APIPort)
+		log.Printf(
+			"search API listening on port %s",
+			cfg.APIPort,
+		)
 
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {

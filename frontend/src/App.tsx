@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SubmitEvent } from "react";
 import "./App.css";
+import { CrawlerStatus } from "./components/CrawlerStatus";
 import { searchPages } from "./services/api";
 import type { SearchResponse } from "./types/search";
 
@@ -8,6 +9,7 @@ const PAGE_SIZE = 10;
 
 function stripMarkup(value: string): string {
   const parser = new DOMParser();
+
   return parser.parseFromString(value, "text/html").body.textContent ?? "";
 }
 
@@ -34,6 +36,7 @@ function App() {
     }
 
     requestController.current?.abort();
+
     const controller = new AbortController();
     requestController.current = controller;
 
@@ -70,6 +73,7 @@ function App() {
     event.preventDefault();
 
     const trimmedQuery = input.trim();
+
     if (!trimmedQuery) {
       setError("Enter a search query.");
       return;
@@ -81,6 +85,8 @@ function App() {
 
   return (
     <main className="page-shell">
+      <CrawlerStatus />
+
       <section className="hero">
         <p className="eyebrow">Distributed Search Engine</p>
         <h1>Search the pages your crawler indexed</h1>
@@ -140,7 +146,9 @@ function App() {
                     <p className="result-url">{result.url}</p>
                     <p
                       className="snippet"
-                      dangerouslySetInnerHTML={{ __html: result.snippet }}
+                      dangerouslySetInnerHTML={{
+                        __html: result.snippet,
+                      }}
                     />
                     <p className="score">
                       Relevance score: {result.score.toFixed(3)}

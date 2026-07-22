@@ -5,7 +5,52 @@
 .page-shell {
   width: min(960px, calc(100% - 32px));
   margin: 0 auto;
-  padding: 72px 0;
+  padding: 40px 0 72px;
+}
+
+.crawler-status {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 56px;
+  padding: 18px 20px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 16px;
+}
+
+.crawler-status-label {
+  margin: 0 0 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.65;
+}
+
+.crawler-status-summary,
+.crawler-status-empty,
+.crawler-status-error {
+  margin: 0;
+}
+
+.crawler-status-error {
+  font-size: 0.85rem;
+}
+
+.crawler-instance-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.crawler-instance-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 16px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(127, 127, 127, 0.2);
+  font-size: 0.82rem;
 }
 
 .hero {
@@ -157,7 +202,12 @@ button:disabled {
 
 @media (max-width: 640px) {
   .page-shell {
-    padding-top: 48px;
+    padding-top: 24px;
+  }
+
+  .crawler-instance-list li {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 
   .search-form {

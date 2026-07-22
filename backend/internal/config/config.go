@@ -23,6 +23,7 @@ type Config struct {
 	CrawlerMaxPagesPerDomain int
 	CrawlerMaxRetries        int
 	CrawlerWorkerCount       int
+	CrawlerHeartbeatInterval time.Duration
 }
 
 func Load() Config {
@@ -94,6 +95,12 @@ func Load() Config {
 			"CRAWLER_WORKER_COUNT",
 			4,
 		),
+		CrawlerHeartbeatInterval: time.Duration(
+			getEnvInt(
+				"CRAWLER_HEARTBEAT_INTERVAL_SECONDS",
+				10,
+			),
+		) * time.Second,
 	}
 }
 
